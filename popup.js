@@ -65,6 +65,9 @@ const LOCALES = Object.freeze({
 });
 
 const enabledInput = document.getElementById("enabled");
+const autoByIpInput = document.getElementById("auto-by-ip");
+const refreshIpButton = document.getElementById("refresh-ip");
+const ipStatusDetail = document.getElementById("ip-status");
 const countrySelect = document.getElementById("country");
 const localeSelect = document.getElementById("locale");
 const timeZoneSelect = document.getElementById("time-zone");
@@ -78,6 +81,8 @@ const confirmResetButton = document.getElementById("confirm-reset");
 
 let settings = {
   enabled: true,
+  autoByIp: false,
+  ipStatus: null,
   country: "US",
   locale: "en-US",
   timeZone: "America/New_York"
@@ -125,6 +130,8 @@ function normalizeSettings(value) {
 
   return {
     enabled: value.enabled !== false,
+    autoByIp: value.autoByIp === true,
+    ipStatus: value.ipStatus || null,
     country,
     locale,
     timeZone
@@ -143,6 +150,14 @@ function render() {
 
   settings = normalizeSettings(settings);
   enabledInput.checked = settings.enabled;
+  autoByIpInput.checked = settings.autoByIp;
+  for (const select of [countrySelect, localeSelect, timeZoneSelect]) select.disabled = settings.autoByIp;
+  refreshIpButton.disabled = !settings.autoByIp || !settings.enabled;
+  const result = settings.ipStatus;
+  ipStatusDetail.textContent = !settings.autoByIp ? "Manual settings" : !settings.enabled ? "IP checks paused" : !result
+    ? "Waiting for IP lookup…"
+    : result.ok ? `${result.country} · ${result.timeZone} · ${new Date(result.checkedAt).toLocaleTimeString()}`
+      : result.error;
   countrySelect.value = settings.country;
   localeSelect.value = settings.locale;
   populateTimeZones(settings.country, settings.timeZone);
@@ -214,6 +229,25 @@ enabledInput.addEventListener("change", () => {
   void save({enabled: enabledInput.checked});
 });
 
+autoByIpInput.addEventListener("change", () => {
+  void save({autoByIp: autoByIpInput.checked});
+});
+
+refreshIpButton.addEventListener("click", async () => {
+  refreshIpButton.disabled = true;
+  ipStatusDetail.textContent = "Checking IP…";
+  try {
+    const response = await chrome.runtime.sendMessage({type: "REGION_CLOAK_REFRESH_IP"});
+    if (!response?.ok) throw new Error("IP lookup failed");
+    settings = normalizeSettings({...settings, ...response.settings, ipStatus: response.ipStatus});
+    render();
+  } catch {
+    ipStatusDetail.textContent = "IP lookup failed; current settings were kept";
+  } finally {
+    refreshIpButton.disabled = !settings.autoByIp || !settings.enabled;
+  }
+});
+
 countrySelect.addEventListener("change", () => {
   const country = COUNTRIES[countrySelect.value];
   if (!country) return;
@@ -254,7 +288,7 @@ resetDialog.addEventListener("click", (event) => {
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
-  for (const key of ["enabled", "country", "locale", "timeZone"]) {
+  for (const key of ["enabled", "autoByIp", "ipStatus", "country", "locale", "timeZone"]) {
     if (changes[key]) settings[key] = changes[key].newValue;
   }
   render();

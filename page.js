@@ -1,4 +1,4 @@
-(() => {
+(function installRegionCloak() {
   const BOOTSTRAP_KEY = Symbol.for("chatgpt-region-cloak.bootstrap.v3");
   const STATE_KEY = Symbol.for("chatgpt-region-cloak.state.v3");
   const EVENT_NAME = "__CHATGPT_REGION_CLOAK_CONFIG_V3__";
@@ -41,10 +41,16 @@
   }
 
   const OriginalDate = Date;
+  const originalParse = Date.parse;
   const originalDateMethods = new Map();
   const originalIntlConstructors = new Map();
   const originalNavigatorDescriptors = new Map();
   const originalHistoryMethods = new Map();
+  const originalWorkerConstructors = new Map();
+  const originalObjectUrlMethods = new Map();
+  const workerObjectUrls = new Map();
+  const workerResourceRestores = [];
+  const workerBootstraps = new Map();
   const formatterCache = new Map();
   const config = {
     enabled: false,
@@ -76,6 +82,7 @@
         calendar: "gregory",
         numberingSystem: "latn",
         year: "numeric",
+        era: "short",
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
@@ -101,7 +108,7 @@
     }
 
     const OriginalDateTimeFormat = originalIntlConstructors.get("DateTimeFormat") || Intl.DateTimeFormat;
-    const formatter = new OriginalDateTimeFormat(config.locale, options);
+    const formatter = new OriginalDateTimeFormat("en-US", options);
     formatterCache.set(key, formatter);
     return formatter;
   }
@@ -120,7 +127,7 @@
     }
 
     return {
-      year: Number(result.year),
+      year: result.era === "BC" ? 1 - Number(result.year) : Number(result.year),
       month: Number(result.month) - 1,
       date: Number(result.day),
       hours: Number(result.hour),
@@ -153,9 +160,9 @@
     const parts = getZoneParts(date);
     if (!parts) return NaN;
 
-    const instantAtSecondPrecision = Math.trunc(timestamp / 1000) * 1000;
+    const instantAtSecondPrecision = Math.floor(timestamp / 1000) * 1000;
     const wallAtSecondPrecision = wallTime({...parts, milliseconds: 0});
-    return Math.round((instantAtSecondPrecision - wallAtSecondPrecision) / 60000);
+    return (instantAtSecondPrecision - wallAtSecondPrecision) / 60000;
   }
 
   function zonedLocalToTimestamp(parts) {
@@ -201,9 +208,11 @@
       if (part.type !== "literal") values[part.type] = part.value;
     }
 
-    const dateText = `${values.weekday} ${values.month} ${values.day} ${values.year}`;
+    const year = getZoneParts(date).year;
+    const yearText = year < 0 ? `-${String(-year).padStart(4, "0")}` : String(year).padStart(4, "0");
+    const dateText = `${values.weekday} ${values.month} ${values.day} ${yearText}`;
     const timeText = `${values.hour}:${values.minute}:${values.second}`;
-    const offset = -getZoneOffset(date);
+    const offset = -Math.trunc(getZoneOffset(date));
     const sign = offset >= 0 ? "+" : "-";
     const absoluteOffset = Math.abs(offset);
     const offsetText = `${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, "0")}${String(absoluteOffset % 60).padStart(2, "0")}`;
@@ -305,6 +314,51 @@
     originalDateMethods.set(name, OriginalDate.prototype[name]);
   }
 
+  // ISO date-only strings denote UTC. Date-times without an offset and legacy
+  // local strings instead denote wall time in the selected time zone.
+  function parseDateString(value) {
+    const text = `${value}`;
+    const nativeResult = originalParse(text);
+    if (!Number.isFinite(nativeResult)) return nativeResult;
+    if (/^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/.test(text)) return nativeResult;
+    let input = text;
+    // Legacy parsers ignore parenthesized comments, including nested comments.
+    // A letter Z inside a comment is not an explicit UTC designator.
+    while (/\([^()]*\)/.test(input)) input = input.replace(/\([^()]*\)/g, "");
+    input = input.trim();
+    const explicitOffset = /[+-]\d{2}(?::?\d{2})?$/.test(input) && /\d:\d/.test(input);
+    if (/(?:\bz$|\b(?:gmt|utc|[ecmp][sd]t)\b)/i.test(input) || /\dZ$/i.test(input) || explicitOffset) {
+      return nativeResult;
+    }
+
+    const isoLocal = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/i.test(input);
+    const wall = originalParse(isoLocal ? `${input}Z` : `${input} UTC`);
+    if (!Number.isFinite(wall)) return nativeResult;
+    const neutral = new OriginalDate(wall);
+    return zonedLocalToTimestamp({
+      year: neutral.getUTCFullYear(), month: neutral.getUTCMonth(), date: neutral.getUTCDate(),
+      hours: neutral.getUTCHours(), minutes: neutral.getUTCMinutes(),
+      seconds: neutral.getUTCSeconds(), milliseconds: neutral.getUTCMilliseconds()
+    });
+  }
+
+  function toDatePrimitive(value) {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+    const exotic = value[Symbol.toPrimitive];
+    if (exotic != null) {
+      if (typeof exotic !== "function") throw new TypeError("Invalid primitive conversion");
+      const result = exotic.call(value, "default");
+      if (Object(result) === result) throw new TypeError("Cannot convert object to primitive value");
+      return result;
+    }
+    for (const name of ["valueOf", "toString"]) {
+      if (typeof value[name] !== "function") continue;
+      const result = value[name]();
+      if (Object(result) !== result) return result;
+    }
+    throw new TypeError("Cannot convert object to primitive value");
+  }
+
   function defineDateMethod(name, implementation) {
     Object.defineProperty(OriginalDate.prototype, name, {
       configurable: true,
@@ -316,6 +370,7 @@
   function patchDate() {
     const methodsToSave = [
       "getTime",
+      "constructor",
       "getUTCDate",
       "getUTCDay",
       "getUTCFullYear",
@@ -384,7 +439,7 @@
     });
 
     defineDateMethod("getTimezoneOffset", function regionAlignedOffset() {
-      return getZoneOffset(this);
+      return Math.trunc(getZoneOffset(this));
     });
 
     defineDateMethod("toString", function regionAlignedToString() {
@@ -424,20 +479,26 @@
 
     for (const [name, fields] of Object.entries(setterDefinitions)) {
       defineDateMethod(name, function regionAlignedDateSetter(...args) {
-        const parts = getZoneParts(this);
-        if (!parts) return NaN;
+        let parts = getZoneParts(this);
+        // Native setters still coerce their arguments when the date is invalid.
+        const numbers = fields.slice(0, Math.max(1, args.length)).map((_, index) => +args[index]);
+        if (!parts && name === "setFullYear") {
+          parts = {year: 1970, month: 0, date: 1, hours: 0, minutes: 0, seconds: 0, milliseconds: 0};
+        }
+        if (!parts) return originalDateMethods.get("setTime").call(this, NaN);
         fields.slice(0, Math.max(1, args.length)).forEach((field, index) => {
-          parts[field] = Number(args[index]);
+          parts[field] = numbers[index];
         });
         return originalDateMethods.get("setTime").call(this, zonedLocalToTimestamp(parts));
       });
     }
 
     defineDateMethod("setYear", function regionAlignedSetYear(year) {
-      const parts = getZoneParts(this);
-      if (!parts) return NaN;
-      const numericYear = Number(year);
-      parts.year = numericYear >= 0 && numericYear <= 99 ? numericYear + 1900 : numericYear;
+      let parts = getZoneParts(this);
+      const numericYear = +year;
+      if (!parts) parts = {year: 1970, month: 0, date: 1, hours: 0, minutes: 0, seconds: 0, milliseconds: 0};
+      const integerYear = Math.trunc(numericYear);
+      parts.year = integerYear >= 0 && integerYear <= 99 ? integerYear + 1900 : integerYear;
       return originalDateMethods.get("setTime").call(this, zonedLocalToTimestamp(parts));
     });
 
@@ -446,21 +507,31 @@
         return formatDateString(new OriginalDate(), "full");
       },
       construct(target, args, newTarget) {
-        if (args.length < 2) {
-          return Reflect.construct(target, args, newTarget === DateProxy ? target : newTarget);
+        if (args.length === 0) return Reflect.construct(target, args, newTarget);
+        if (args.length === 1) {
+          let value;
+          try {
+            // Date instances are copied without consulting their coercion hooks.
+            value = getTime(args[0]);
+          } catch {
+            value = toDatePrimitive(args[0]);
+            if (typeof value === "string") value = parseDateString(value);
+          }
+          return Reflect.construct(target, [value], newTarget);
         }
 
         const values = [
-          Number(args[0]),
-          Number(args[1]),
-          args.length > 2 ? Number(args[2]) : 1,
-          args.length > 3 ? Number(args[3]) : 0,
-          args.length > 4 ? Number(args[4]) : 0,
-          args.length > 5 ? Number(args[5]) : 0,
-          args.length > 6 ? Number(args[6]) : 0
+          +args[0],
+          +args[1],
+          args.length > 2 ? +args[2] : 1,
+          args.length > 3 ? +args[3] : 0,
+          args.length > 4 ? +args[4] : 0,
+          args.length > 5 ? +args[5] : 0,
+          args.length > 6 ? +args[6] : 0
         ];
 
-        if (values[0] >= 0 && values[0] <= 99) values[0] += 1900;
+        const integerYear = Math.trunc(values[0]);
+        if (integerYear >= 0 && integerYear <= 99) values[0] = integerYear + 1900;
         const timestamp = zonedLocalToTimestamp({
           year: values[0],
           month: values[1],
@@ -474,16 +545,21 @@
         return Reflect.construct(
           target,
           [timestamp],
-          newTarget === DateProxy ? target : newTarget
+          newTarget
         );
       }
     });
 
+    defineDateMethod("constructor", DateProxy);
+    Object.defineProperty(OriginalDate, "parse", {configurable: true, writable: true, value: function parse(value) {
+      return parseDateString(value);
+    }});
     globalThis.Date = DateProxy;
   }
 
   function restoreDate() {
     globalThis.Date = OriginalDate;
+    Object.defineProperty(OriginalDate, "parse", {configurable: true, writable: true, value: originalParse});
     for (const [name, implementation] of originalDateMethods) {
       defineDateMethod(name, implementation);
     }
@@ -552,18 +628,148 @@
     originalHistoryMethods.clear();
   }
 
+  function patchWorkers() {
+    if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+      const create = URL.createObjectURL;
+      const revoke = URL.revokeObjectURL;
+      originalObjectUrlMethods.set("createObjectURL", create);
+      originalObjectUrlMethods.set("revokeObjectURL", revoke);
+      URL.createObjectURL = new Proxy(create, {
+        apply(target, receiver, args) {
+          const url = Reflect.apply(target, receiver, args);
+          workerObjectUrls.set(url, args[0]);
+          return url;
+        }
+      });
+      URL.revokeObjectURL = new Proxy(revoke, {
+        apply(target, receiver, args) {
+          if (args.length) {
+            const url = `${args[0]}`;
+            workerObjectUrls.delete(url);
+            args[0] = url;
+          }
+          return Reflect.apply(target, receiver, args);
+        }
+      });
+    }
+    for (const name of ["Worker", "SharedWorker"]) {
+      const OriginalWorker = globalThis[name];
+      if (typeof OriginalWorker !== "function") continue;
+      originalWorkerConstructors.set(name, OriginalWorker);
+      let proxy;
+      proxy = new Proxy(OriginalWorker, {
+        construct(target, args, newTarget) {
+          if (!args.length) return Reflect.construct(target, args, newTarget);
+          const url = new URL(`${args[0]}`, globalThis.__regionWorkerBase || location.href);
+          // Keep native origin/protocol checks for remote URLs and data URLs.
+          if (url.origin !== location.origin || !["https:", "http:", "blob:"].includes(url.protocol)) {
+            return Reflect.construct(target, args, newTarget);
+          }
+          const options = args[1];
+          const module = options != null && typeof options === "object" && options.type === "module";
+          const key = JSON.stringify([url.href, module, config]);
+          let entry = workerBootstraps.get(key);
+          if (!entry) {
+            const createObjectURL = originalObjectUrlMethods.get("createObjectURL");
+            // Pages commonly revoke their blob URL immediately after constructing
+            // a worker. Hold a separate URL until the bootstrap has loaded it.
+            const retainedSource = workerObjectUrls.has(url.href)
+              ? createObjectURL.call(URL, workerObjectUrls.get(url.href)) : null;
+            const setup = `globalThis[Symbol.for("chatgpt-region-cloak.bootstrap.v3")]=${JSON.stringify(config)};\n` +
+              `globalThis.__regionWorkerBase=${JSON.stringify(url.href)};\n` +
+              `(${installRegionCloak.toString()})();\n`;
+            const sourceUrl = JSON.stringify(retainedSource || url.href);
+            if (module) {
+              const setupUrl = createObjectURL.call(URL, new Blob([setup], {type: "text/javascript"}));
+              const wrapperUrl = createObjectURL.call(URL, new Blob([
+                `import ${JSON.stringify(setupUrl)};\nimport ${sourceUrl};\n`
+              ], {type: "text/javascript"}));
+              entry = [wrapperUrl, setupUrl, retainedSource];
+            } else {
+              const imports = `const nativeImportScripts=globalThis.importScripts;\n` +
+                `globalThis.importScripts=(...urls)=>nativeImportScripts(...urls.map(value=>new URL(value,${sourceUrl}).href));\n` +
+                `nativeImportScripts(${sourceUrl});\n`;
+              entry = [createObjectURL.call(URL, new Blob([setup, imports], {type: "text/javascript"})), retainedSource];
+            }
+            workerBootstraps.set(key, entry);
+          }
+          return Reflect.construct(target, [entry[0], ...args.slice(1)], newTarget === proxy ? target : newTarget);
+        }
+      });
+      globalThis[name] = proxy;
+    }
+  }
+
+  function patchWorkerResources() {
+    const base = globalThis.__regionWorkerBase;
+    if (typeof document !== "undefined" || !base) return;
+    const NativeRequest = globalThis.Request;
+    const resolveInput = (input) => NativeRequest && input instanceof NativeRequest
+      ? input : new URL(`${input}`, base).href;
+    if (typeof globalThis.fetch === "function") {
+      const nativeFetch = globalThis.fetch;
+      globalThis.fetch = new Proxy(nativeFetch, {
+        apply(target, receiver, args) {
+          if (args.length) args[0] = resolveInput(args[0]);
+          return Reflect.apply(target, receiver, args);
+        }
+      });
+      workerResourceRestores.push(() => { globalThis.fetch = nativeFetch; });
+    }
+    if (typeof NativeRequest === "function") {
+      const constructor = Object.getOwnPropertyDescriptor(NativeRequest.prototype, "constructor");
+      const proxy = new Proxy(NativeRequest, {
+        construct(target, args, newTarget) {
+          if (args.length) args[0] = resolveInput(args[0]);
+          return Reflect.construct(target, args, newTarget);
+        }
+      });
+      globalThis.Request = proxy;
+      Object.defineProperty(NativeRequest.prototype, "constructor", {...constructor, value: proxy});
+      workerResourceRestores.push(() => {
+        globalThis.Request = NativeRequest;
+        Object.defineProperty(NativeRequest.prototype, "constructor", constructor);
+      });
+    }
+    if (typeof globalThis.XMLHttpRequest === "function") {
+      const prototype = globalThis.XMLHttpRequest.prototype;
+      const nativeOpen = prototype.open;
+      prototype.open = new Proxy(nativeOpen, {
+        apply(target, receiver, args) {
+          if (args.length > 1) args[1] = new URL(`${args[1]}`, base).href;
+          return Reflect.apply(target, receiver, args);
+        }
+      });
+      workerResourceRestores.push(() => { prototype.open = nativeOpen; });
+    }
+  }
+
+  function restoreWorkers() {
+    for (const [name, original] of originalWorkerConstructors) globalThis[name] = original;
+    originalWorkerConstructors.clear();
+    for (const [name, original] of originalObjectUrlMethods) URL[name] = original;
+    originalObjectUrlMethods.clear();
+    workerObjectUrls.clear();
+    for (const restore of workerResourceRestores.splice(0)) restore();
+    // Running workers keep their snapshot until the page is reloaded. Keep the
+    // cached URLs alive so SharedWorker URL/name identity remains stable.
+  }
+
   function enable() {
     if (patched) return;
     patchNavigator();
     patchIntl();
     patchDate();
-    patchHistory();
+    patchWorkerResources();
+    patchWorkers();
+    if (typeof history !== "undefined") patchHistory();
     patched = true;
   }
 
   function disable() {
     if (!patched) return;
     restoreHistory();
+    restoreWorkers();
     restoreDate();
     restoreIntl();
     restoreNavigator();
@@ -590,7 +796,7 @@
     value: api
   });
 
-  window.addEventListener(EVENT_NAME, (event) => {
+  globalThis.addEventListener(EVENT_NAME, (event) => {
     if (typeof event.detail !== "string") return;
     try {
       api.apply(JSON.parse(event.detail));

@@ -1,8 +1,8 @@
 # Privacy Policy for ChatGPT Region Cloak
 
-Effective date: October 14, 2026
+Effective date: October 15, 2026
 
-ChatGPT Region Cloak operates locally in the browser. It does not collect, transmit, sell, share, or remotely store personal information, authentication information, browsing history, website content, chat content, or usage analytics.
+ChatGPT Region Cloak applies browser language and time-zone settings locally. Optional IP matching contacts a third-party location service as described below. The extension does not collect authentication information, browsing history, website content, chat content, or usage analytics.
 
 ## Data stored locally
 
@@ -12,6 +12,8 @@ The extension stores only these preferences in Chrome's local extension storage:
 - the selected country or region preset;
 - the selected browser language;
 - the selected time zone.
+- whether automatic IP matching is enabled;
+- the last IP lookup time, detected country and time zone, or error status. The IP address and full location response are not stored.
 
 These preferences remain on the user's device until the user changes them, clears extension data, or uninstalls the extension.
 
@@ -25,7 +27,9 @@ The **Reset ChatGPT** feature runs only after the user opens the extension, choo
 
 ## Network communication and sharing
 
-The extension has no analytics, advertising, tracking, telemetry, external server, or remote code. It does not transfer user data to the developer or any third party. It does not use Google APIs or collect Google user data.
+Automatic IP matching is off by default. When enabled and the extension is running, it requests `https://ipwho.is/` on browser startup, when enabled, approximately every 15 minutes, and when the user presses **Check IP now**. The service sees the public IP used for that request and returns its estimated country and time zone. Cookies, credentials, page URLs, and page content are not sent. Proxy or VPN routing determines which public IP the service sees; this may differ from the route used for ChatGPT under split routing. Disabling automatic matching or pausing the extension stops future checks.
+
+The service is operated by a third party under its own [privacy policy](https://ipwhois.io/privacy-policy). Lookup failures or unsupported locations keep the existing settings. There is no analytics, advertising, telemetry, remote executable code, or developer-operated data collection server. The extension does not use Google APIs or collect Google user data.
 
 ## Policy updates
 

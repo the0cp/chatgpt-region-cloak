@@ -31,6 +31,13 @@
 
       <section class="settings" aria-labelledby="region-heading">
         <h2 id="region-heading">Region</h2>
+        <label class="auto-option">
+          <input id="auto-by-ip" type="checkbox">
+          <span>Automatically match my IP</span>
+        </label>
+        <p class="auto-help">Checks your public IP with ipwho.is on startup and every 15 minutes. Uses supported region presets. Reload pages after a change to update existing workers.</p>
+        <p class="auto-detail" id="ip-status" aria-live="polite"></p>
+        <button class="ip-refresh" id="refresh-ip" type="button">Check IP now</button>
         <div class="settings-grid">
           <label class="select-field">
             <span class="field-label">Country or region</span>

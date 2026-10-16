@@ -27,6 +27,7 @@ const SUPPORTED_TIME_ZONES = new Set(
 
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
+  autoByIp: false,
   country: "US",
   locale: "en-US",
   timeZone: "America/New_York"
@@ -43,7 +44,7 @@ const MATCHES = Object.freeze([
   "*://chatgpt.com/*",
   "*://*.chatgpt.com/*",
   "*://openai.com/*",
-  "*://chat.openai.com/*"
+  "*://*.openai.com/*"
 ]);
 
 const CHATGPT_RESET_ORIGINS = Object.freeze([
@@ -57,6 +58,77 @@ const MAIN_SCRIPT_ID = "chatgpt-region-cloak-main";
 const LEGACY_MAIN_SCRIPT_IDS = Object.freeze(["us-region-aligner-main"]);
 const NETWORK_RULE_IDS = Object.freeze([1001, 1002]);
 const LEGACY_RULE_IDS = Object.freeze([1]);
+const IP_ALARM = "region-cloak-ip-refresh";
+const IP_REFRESH_MINUTES = 15;
+let ipRefreshInFlight = null;
+let ipRequestGeneration = 0;
+
+function settingsFromIp(data) {
+  if (data?.success !== true) throw new Error("IP location lookup failed");
+  const country = data.country_code;
+  if (!Object.hasOwn(COUNTRIES, country)) {
+    throw new Error("The detected country is not supported; current settings were kept");
+  }
+  const aliases = {"Asia/Calcutta": "Asia/Kolkata", "US/Eastern": "America/New_York", "US/Pacific": "America/Los_Angeles"};
+  const detected = data.timezone?.id;
+  const timeZone = aliases[detected] || detected;
+  if (!COUNTRIES[country].timeZones.includes(timeZone)) {
+    throw new Error("The detected time zone is not supported; current settings were kept");
+  }
+  return {country, locale: COUNTRIES[country].locale, timeZone};
+}
+
+async function refreshIpSettings() {
+  if (ipRefreshInFlight) return ipRefreshInFlight;
+  ipRefreshInFlight = (async () => {
+    const settings = await getSettings();
+    if (!settings.autoByIp || !settings.enabled) return settings;
+    const generation = ipRequestGeneration;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch("https://ipwho.is/", {
+        signal: controller.signal, cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer"
+      });
+      if (!response.ok) throw new Error("IP location service is unavailable; current settings were kept");
+      const next = settingsFromIp(await response.json());
+      const current = await getSettings();
+      if (!current.autoByIp || !current.enabled || generation !== ipRequestGeneration) return current;
+      await chrome.storage.local.set({
+        ...next,
+        ipStatus: {ok: true, checkedAt: Date.now(), country: next.country, timeZone: next.timeZone}
+      });
+      return await scheduleReconcile();
+    } catch (error) {
+      const current = await getSettings();
+      if (current.autoByIp && current.enabled && generation === ipRequestGeneration) {
+        const message = error?.name === "AbortError"
+          ? "IP lookup timed out; current settings were kept"
+          : error instanceof Error ? error.message : "IP lookup failed; current settings were kept";
+        await chrome.storage.local.set({ipStatus: {ok: false, checkedAt: Date.now(), error: message}});
+      }
+      return current;
+    } finally {
+      clearTimeout(timeout);
+    }
+  })().finally(() => { ipRefreshInFlight = null; });
+  return ipRefreshInFlight;
+}
+
+async function syncIpMode(force = false) {
+  const settings = await getSettings();
+  if (!settings.autoByIp || !settings.enabled) {
+    await chrome.alarms.clear(IP_ALARM);
+    return;
+  }
+  if (!await chrome.alarms.get(IP_ALARM)) {
+    await chrome.alarms.create(IP_ALARM, {periodInMinutes: IP_REFRESH_MINUTES});
+  }
+  const {ipStatus} = await chrome.storage.local.get("ipStatus");
+  if (force || !ipStatus || Date.now() - ipStatus.checkedAt >= IP_REFRESH_MINUTES * 60000) {
+    await refreshIpSettings();
+  }
+}
 
 const LOCALE_FILES = Object.freeze(Object.fromEntries(
   [...SUPPORTED_LOCALES].map((locale) => [locale, `config/locales/${locale.toLowerCase()}.js`])
@@ -92,6 +164,7 @@ function normalizeSettings(value) {
 
   return {
     enabled: value.enabled !== false,
+    autoByIp: value.autoByIp === true,
     country,
     locale: SUPPORTED_LOCALES.has(value.locale) ? value.locale : countrySettings.locale,
     timeZone: countrySettings.timeZones.includes(value.timeZone)
@@ -106,13 +179,14 @@ async function getSettings() {
 
 async function ensureDefaults() {
   const stored = await chrome.storage.local.get([
-    "enabled", "country", "locale", "timeZone", "zone"
+    "enabled", "autoByIp", "country", "locale", "timeZone", "zone"
   ]);
   const patch = {};
 
   if (typeof stored.enabled !== "boolean") {
     patch.enabled = DEFAULT_SETTINGS.enabled;
   }
+  if (typeof stored.autoByIp !== "boolean") patch.autoByIp = false;
 
   const country = Object.hasOwn(COUNTRIES, stored.country)
     ? stored.country
@@ -223,6 +297,8 @@ async function updateMainWorldRegistration(settings) {
       "page.js"
     ],
     runAt: "document_start",
+    allFrames: true,
+    matchOriginAsFallback: true,
     world: "MAIN",
     persistAcrossSessions: true
   };
@@ -250,7 +326,7 @@ async function updateOpenTabs(settings) {
 
     if (settings.enabled) {
       await chrome.scripting.executeScript({
-        target: {tabId: tab.id},
+        target: {tabId: tab.id, allFrames: true},
         files: [
           "config/base.js",
           LOCALE_FILES[settings.locale],
@@ -336,20 +412,40 @@ function scheduleReconcile() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void scheduleReconcile();
+  void scheduleReconcile().then(() => syncIpMode(true));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void scheduleReconcile();
+  void scheduleReconcile().then(() => syncIpMode(true));
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === IP_ALARM) void refreshIpSettings();
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
-  if (!changes.enabled && !changes.country && !changes.locale && !changes.timeZone && !changes.zone) return;
+  if (changes.autoByIp || changes.enabled) {
+    ipRequestGeneration++;
+    void scheduleReconcile().then(() => syncIpMode(true));
+    return;
+  }
+  if (!changes.country && !changes.locale && !changes.timeZone && !changes.zone) return;
   void scheduleReconcile();
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  // Only extension pages can trigger settings changes or destructive resets.
+  if (_sender.id !== chrome.runtime.id || _sender.tab) return undefined;
+  if (message?.type === "REGION_CLOAK_REFRESH_IP") {
+    refreshIpSettings()
+      .then(async (settings) => {
+        const {ipStatus} = await chrome.storage.local.get("ipStatus");
+        sendResponse({ok: true, settings, ipStatus});
+      })
+      .catch((error) => sendResponse({ok: false, error: String(error)}));
+    return true;
+  }
   if (message?.type === "US_REGION_ALIGNER_APPLY_NOW") {
     scheduleReconcile()
       .then((settings) => sendResponse({ok: true, settings}))
@@ -367,4 +463,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return undefined;
 });
 
-void scheduleReconcile();
+void scheduleReconcile().then(() => syncIpMode());

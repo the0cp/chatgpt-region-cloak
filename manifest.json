@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Region Cloak",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "description": "Align ChatGPT browser language and time zone signals with regional presets and an optional clean sign-in reset.",
-  "minimum_chrome_version": "102",
+  "minimum_chrome_version": "119",
   "permissions": [
     "storage",
+    "alarms",
     "scripting",
     "browsingData",
     "declarativeNetRequestWithHostAccess"
@@ -14,7 +15,8 @@
     "*://chatgpt.com/*",
     "*://*.chatgpt.com/*",
     "*://openai.com/*",
-    "*://chat.openai.com/*"
+    "*://*.openai.com/*",
+    "https://ipwho.is/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -31,10 +33,12 @@
         "*://chatgpt.com/*",
         "*://*.chatgpt.com/*",
         "*://openai.com/*",
-        "*://chat.openai.com/*"
+        "*://*.openai.com/*"
       ],
       "js": ["bridge.js"],
       "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true,
       "world": "ISOLATED"
     }
   ],

@@ -205,6 +205,35 @@ button:focus-visible {
   gap: 10px;
 }
 
+.auto-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.auto-help, .auto-detail {
+  margin-top: 8px;
+  color: var(--on-surface-variant);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ip-refresh {
+  margin: 10px 0;
+  padding: 7px 12px;
+  color: var(--primary);
+  border: 1px solid var(--outline-variant);
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+}
+
+button:disabled, select:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .field-label {
   position: absolute;
   top: 6px;
